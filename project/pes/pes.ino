@@ -1,58 +1,66 @@
 /*
   Abo Akademi University 
   Programming Embedded Systems 2015
-  Final project: 
+  Final project:  
   Authors:  Vu Nguyen <quangngmetro@gmail.com>
-            ....
+                  
 */
 
 //Project headers to include user libraries and system libraries
-#include <PES_dht11.h>
+#include <TSL2561.h>
+#include <DHT11.h>
+#include <Wire.h>
+#include <LiquidCrystal.h>
 
 
-
-//user defined macros
 #define DEBUG 0
-#define SERIAL_BAUD_RATE        9600
-#define DHT_PIN                 4
-#define DEBOUNCE_TIME		150	//50 milliseconds
-#define LIGHT_ON_TIME		60000	//1 minute
-#define TEMP_ON_TIME		300000	//5 minutes
-#define HUM_ON_TIME		300000	//5 minutes
+#define SERIAL_BAUD_RATE 9600
+#define DHT_PIN 4
+#define DEBOUNCE_TIME 100	//100 milliseconds
+#define LIGHT_ON_TIME	60000	//1 minute
+#define TEMP_ON_TIME 180000	//3 minutes
+#define HUM_ON_TIME 180000	//3 minutes
+
+
 #define TEMP_LOWER_LIMIT	20
 #define TEMP_UPPER_LIMIT	30
-#define HUM_LOWER_LIMIT		30
-#define HUM_UPPER_LIMIT		40
-#define ON			true
-#define OFF			false
-#define LCD_RS			10
-#define LCD_ENABLE		9
-#define LCD_D4			8
-#define LCD_D5			7
-#define LCD_D6			6
-#define LCD_D7			5
-#define LCD_ROW			2
-#define LCD_COLUMN		16
-#define IDEAL_OFFICE_LUX	450
+#define HUM_LOWER_LIMIT	30
+#define HUM_UPPER_LIMIT	40
+#define LIGHT_LOWER_LIMIT 445
+#define LIGHT_UPPER_LIMIT 455
+#define IDEAL_OFFICE_LUX 450
+
+#define LIGHT_ON true
+#define LIGHT_OFF false
+
+#define LCD_RS 10
+#define LCD_ENABLE 9
+#define LCD_D4 8
+#define LCD_D5 7
+#define LCD_D6 6
+#define LCD_D7 5
+#define LCD_ROW 2
+#define LCD_COLUMN 16
 
 //user defined data types
 typedef enum {MODE1, MODE2, MODE3, MODE4, MODE5} Tmode;
 
 //global variables
-Tmode currentMode = MODE0;
-Tmode nextMode = MODE1;
-bool lightSelection = ON;
-uint8_t humiditySelection = HUM_LOWER_LIMIT; 		//from 30 to 40
-uint8_t temperatureSelection = TEMP_LOWER_LIMIT; 	//from 20 to 30
+Tmode currentMode = MODE1;
+Tmode nextMode = MODE2;
+
+bool lightState = LIGHT_ON;
+uint16_t lightSelection = IDEAL_OFFICE_LUX;                //from 445 to 455 lux
+uint8_t humiditySelection = HUM_LOWER_LIMIT; 		//from 30 to 40%
+uint8_t temperatureSelection = TEMP_LOWER_LIMIT; 	//from 20 to 30 *C
+
 uint8_t humidity = 0;
-int8_t 	temperature = 0;
-uint32_t lum = 0;
-uint32_t lux = 0;
-uint16_t ir = 0;
-uint16_t full = 0;
-const uint8_t humidifierPin = 11; 	//green led
-const uint8_t lightPin = 12; 			//white led
-const uint8_t heaterPin = 13;			//red led
+int8_t temperature = 0;
+uint32_t light = 0;
+
+const uint8_t humidifierPin = 13; 	//green led
+const uint8_t lightPin = 12; 		//white led
+const uint8_t heaterPin = 11;		//red led
 volatile uint32_t lastDebounceTime = 0;
 volatile uint32_t lastLightOnTime = 0;
 volatile uint32_t lastTempOnTime = 0;
@@ -61,14 +69,14 @@ volatile uint32_t lastHumOnTime = 0;
 //object declarations
 LiquidCrystal lcd(LCD_RS, LCD_ENABLE, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
 TSL2561 tsl(TSL2561_ADDR_LOW);
-DHT dht;
+DHT11 dht11(DHT_PIN);
 
 //function prototypes
+uint32_t readLight(void);
 void isrMode();
 void isrTempHumLight();
-void debounceInterrupt0();
-void debounceInterrupt1();
-
+void isrLeftButtonHandler();
+void isrRightButtonHandler();
 
 
 static void displayMode1();
@@ -79,55 +87,41 @@ static void displayMode5();
 
 //initialization function
 void setup(void) {
-	Serial.begin(SERIAL_BAUD_RATE);
+  Serial.begin(SERIAL_BAUD_RATE);
 
-	dht.setup(DHT_PIN);
+  dht11.begin();
 
-	lcd.begin(LCD_COLUMN, LCD_ROW);
+  lcd.begin(LCD_COLUMN, LCD_ROW);
 
-	if (tsl.begin()) {
-		#ifdef DEBUF
-		Serial.println("Found sensor");
-		#endif
-	} else {
-		#ifdef DEBUF
-		Serial.println("No sensor?");
-		#endif
-		lcd.setCursor(0, 0);
-		lcd.print("No DHT sensor?");
-		while (1);
-	}
-	tsl.setGain(TSL2561_GAIN_0X);         			// set no gain (for bright situtations)
-	tsl.setTiming(TSL2561_INTEGRATIONTIME_13MS);  	// shortest integration time (bright light)
+  if (!tsl.begin()) {
+    #ifdef DEBUF
+    Serial.println("TSL2561 not found!");
+    #endif
+    while (1);
+  }
+  tsl.setGain(TSL2561_GAIN_0X);         			  // set no gain (for bright situtations)
+  tsl.setTiming(TSL2561_INTEGRATIONTIME_13MS);  // shortest integration time (bright light)
 
-	attachInterrupt(1, debounceInterrupt1, RISING);
-	attachInterrupt(0, debounceInterrupt0, RISING);
+  attachInterrupt(1, isrRightButtonHandler, RISING);  //attached to Arduino pin 3, right-hand side button
+  attachInterrupt(0, isrLeftButtonHandler, RISING);  //attached to Arduino pin 2, left-hand side button
 
-	pinMode(lightPin, OUTPUT);
-	pinMode(heaterPin, OUTPUT);
-	pinMode(humidifierPin, OUTPUT);
+  pinMode(lightPin, OUTPUT);
+  pinMode(heaterPin, OUTPUT);
+  pinMode(humidifierPin, OUTPUT);
 }
 
 //forever loop
 void loop(void) {
   //read light sensor
-
+  light = readLight();
 
   //read HT11 sensor
-  humidity =
-  temperature =
-
-  //display humidity and temperature values on the terminal for testing/debugging
-  #ifdef DEBUG
-  Serial.print("Temperature: ");
-  Serial.print(temperature);
-  Serial.print(" *C\t");
-  Serial.print("Humidity: ");
-  Serial.print(humidity);
-  Serial.print(" %\t");
-  Serial.print("Lux: ");
-  Serial.println(lux);
-  #endif
+  if(dht11.read()) {
+    temperature = dht11.readTemperature();
+    humidity = dht11.readHumidity();
+  } else {
+    while(1);
+  }
 
   //display the user interface on the 16X2 LCD
   if (currentMode == MODE1) {
@@ -141,12 +135,6 @@ void loop(void) {
   } else {
     displayMode5();
   }
-
-  #ifdef DEBUG
-  Serial.print("current mode: ");
-  Serial.print(currentMode);
-  Serial.print('\t');
-  #endif
 
   //controlling the outputs: light, humidifier, heater
   //control the heater represented by the red led
@@ -170,36 +158,40 @@ void loop(void) {
   }
 
   //control the light, represented by the white led
-  if (lightSelection == ON) {
-    if (lux < IDEAL_OFFICE_LUX) {
+  if (lightState == LIGHT_ON) {
+    if (light < lightSelection) {
       digitalWrite(lightPin, HIGH);
       lastLightOnTime = millis();
     }
-    if (millis() - lastLightOnTime > LIGHT_ON_TIME) {
-      if (lux >= IDEAL_OFFICE_LUX)
-	  digitalWrite(lightPin, LOW);
-      }
+    if(millis() - lastLightOnTime > LIGHT_ON_TIME) {
+      if (light >= lightSelection)
+        digitalWrite(lightPin, LOW);
+    }
   } else {
     digitalWrite(lightPin, LOW);
   }
+}
 
-  #ifdef DEBUG
-  Serial.print("Time elapsed(ms): ");
-  Serial.println(millis());
-  #endif
-
-  delay(500);
+uint32_t readLight(void) {
+  uint32_t lum;
+  uint16_t ir, full;
+  
+  lum = tsl.getFullLuminosity();
+  ir = lum >> 16;
+  full = lum & 0xFFFF;
+  
+  return tsl.calculateLux(full, ir);
 }
 
 
-void debounceInterrupt0() {
+void isrRightButtonHandler() {
 	if((millis() - lastDebounceTime) > DEBOUNCE_TIME) {
 	    isrTempHumLight();
 	    lastDebounceTime = millis();
 	  }
 }
 
-void debounceInterrupt1() {
+void isrLeftButtonHandler() {
 	if((millis() - lastDebounceTime) > DEBOUNCE_TIME) {
 	    isrMode();
 	    lastDebounceTime = millis();
@@ -208,10 +200,6 @@ void debounceInterrupt1() {
 
 void isrMode() {
 	switch(currentMode) {
-		case MODE0:
-			nextMode = MODE1;
-			currentMode = nextMode;
-			break;
 		case MODE1:
 			nextMode = MODE2;
 			currentMode = nextMode;
@@ -221,7 +209,15 @@ void isrMode() {
 			currentMode = nextMode;
 			break;
 		case MODE3:
-			nextMode = MODE0;
+			nextMode = MODE4;
+			currentMode = nextMode;
+			break;
+		case MODE4:
+			nextMode = MODE5;
+			currentMode = nextMode;
+			break;
+		case MODE5:
+			nextMode = MODE1;
 			currentMode = nextMode;
 			break;
 		default:
@@ -232,19 +228,27 @@ void isrMode() {
 }
 
 void isrTempHumLight() {
-	if (currentMode == MODE1) {
-		temperatureSelection++;
-		if (temperatureSelection == TEMP_UPPER_LIMIT+1)
-			temperatureSelection = TEMP_LOWER_LIMIT;
-	}
-	if (currentMode == MODE2) {
-		humiditySelection++;
-		if (humiditySelection == HUM_UPPER_LIMIT+1)
-			humiditySelection = HUM_LOWER_LIMIT;
-	}
-	if (currentMode == MODE3) {
-		lightSelection = !lightSelection;
-	}
+  if (currentMode == MODE2) {
+    temperatureSelection++;
+    if (temperatureSelection == TEMP_UPPER_LIMIT+1)
+      temperatureSelection = TEMP_LOWER_LIMIT;
+  }
+  
+  if (currentMode == MODE3) {
+    humiditySelection++;
+    if (humiditySelection == HUM_UPPER_LIMIT+1)
+      humiditySelection = HUM_LOWER_LIMIT;
+  }
+  
+  if (currentMode == MODE4) {
+    lightSelection++;
+    if (lightSelection == LIGHT_UPPER_LIMIT+1)
+      lightSelection = LIGHT_LOWER_LIMIT;
+  }
+  
+  if (currentMode == MODE5) {
+    lightState = !lightState;
+  }      
 }
 
 static void displayMode1() {
@@ -256,7 +260,7 @@ static void displayMode1() {
   lcd.setCursor(13, 0); lcd.print(humidity);
   lcd.setCursor(15, 0); lcd.print("%");
   lcd.setCursor(0, 1); lcd.print("Light");
-  lcd.setCursor(6, 1); lcd.print(lux);
+  lcd.setCursor(6, 1); lcd.print(light);
   lcd.setCursor(9, 1); lcd.print("lux"); 
 }
 
@@ -286,28 +290,12 @@ static void displayMode4() {
 
 static void displayMode5() {
   lcd.clear();
-  lcd.setCursor(0,0); lcd.print(“Set light on/off”);
+  lcd.setCursor(0,0); lcd.print("Set light on/off");
   lcd.setCursor(0,1);
-  if (lightSelection == LIGHT_ON) {
-    lcd.print(“ON”);
+  if (lightState == LIGHT_ON) {
+    lcd.print("ON");
   } else {
-    lcd.print(“OFF”);
+    lcd.print("OFF");
   }  
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
